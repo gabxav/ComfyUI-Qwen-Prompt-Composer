@@ -69,9 +69,10 @@ export function refreshPrompts(node) {
 }
 
 app.registerExtension({
-    name: "XavierLAB.SGLangPromptComposer",
+    name: "XavierLAB.QwenPromptComposer",
     async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name !== "SGLangPromptComposer") return;
+        // SGLangPromptComposer is the pre-22/09/2026 alias kept for older workflows.
+        if (!["QwenPromptComposer", "SGLangPromptComposer"].includes(nodeData.name)) return;
         const created = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function (...args) {
             const result = created?.apply(this, args);

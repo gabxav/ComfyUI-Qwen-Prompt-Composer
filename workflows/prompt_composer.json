@@ -160,7 +160,7 @@
     },
     {
       "id": 5,
-      "type": "SGLangPromptComposer",
+      "type": "QwenPromptComposer",
       "pos": [
         600,
         80
@@ -331,7 +331,7 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "SGLangPromptComposer",
+        "Node name for S&R": "QwenPromptComposer",
         "ue_properties": {
           "widget_ue_connectable": {
             "prompt": true,
@@ -371,7 +371,7 @@
       "widgets_values_named": {
         "prompt": "",
         "active_prompt": "system_prompt_1 :: Minimax H3 - V2",
-        "controller_url": "http://sglang-fleetml-dspark.ialab.svc.cluster.local",
+        "controller_url": "http://llm-qwen38-w4a16-control.ialab.svc.cluster.local:8001",
         "max_tokens": 24576,
         "thinking_budget": 16384,
         "temperature": 1,
