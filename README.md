@@ -1,8 +1,8 @@
 # ComfyUI Qwen Prompt Composer
 
-A multimodal prompt-writing node for ComfyUI with editable external system prompts, always-on thinking, and automatic GPU memory handoff: it wakes a vLLM server, generates, and puts the server back to sleep with no VRAM before downstream nodes run.
+A multimodal prompt-writing node for ComfyUI with editable external system prompts and always-on thinking. It streams directly from a resident vLLM server on a dedicated GPU and keeps ComfyUI models loaded.
 
-Formerly **ComfyUI SGLang Prompt Composer**. Since 2026-09-22 it runs on vLLM; the old class name `SGLangPromptComposer` stays registered (hidden from the menu) so saved workflows still load, and an old SGLang `controller_url` saved in a workflow is redirected to the default below.
+Formerly **ComfyUI SGLang Prompt Composer**. Since 2026-09-22 it runs on vLLM; the old class name `SGLangPromptComposer` stays registered (hidden from the menu) so saved workflows still load, and the obsolete `controller_url` input remains in its original position but is ignored.
 
 ## Features
 
@@ -11,12 +11,11 @@ Formerly **ComfyUI SGLang Prompt Composer**. Since 2026-09-22 it runs on vLLM; t
 - Up to 16 system prompt inputs, 8 image inputs, and one video frame batch.
 - Ordered image references and sampled video frames with timestamps.
 - Streams the answer, so a ComfyUI cancel aborts the request on the server.
-- Returns only the final answer, after `gpu_control` confirms vLLM has released the GPU. Weights stay in system RAM.
+- Returns the final answer without reasoning text or changing model residency.
 
 ## Requirements
 
-- A vLLM server started with `--enable-sleep-mode` and `VLLM_SERVER_DEV_MODE=1` (for `/sleep`, `/wake_up`, `/is_sleeping`), serving a Qwen3-style reasoning model. Tested with vLLM 0.28.0, Qwen3.8 27B W4A16, an RTX 5090 and NVIDIA driver 615.71.09.
-- `server/gpu_control.py` running in the same PID namespace as the vLLM engine (same container), with NVIDIA's [`cuda-checkpoint`](https://github.com/NVIDIA/cuda-checkpoint) (driver 550+) and `nvidia-smi` available.
+- A resident vLLM server exposing OpenAI-compatible streaming `/v1/chat/completions` and supporting the configured reasoning model and multimodal inputs. The XavierLAB installation uses `llm-qwen38-27b` on a dedicated GPU.
 - The vLLM image limit (`--limit-mm-per-prompt`) must cover your references plus sampled video frames.
 
 ## Install the ComfyUI node
@@ -32,32 +31,21 @@ Restart ComfyUI while its queue is idle, then reopen the browser page. Find **Qw
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `COMFYUI_LLM_CONTROL_URL` | `http://llm-qwen38-w4a16-control.ialab.svc.cluster.local:8001` | `gpu_control` base URL (also the node's `controller_url` default) |
-| `COMFYUI_LLM_URL` | `http://llm-qwen38-w4a16.ialab.svc.cluster.local` | vLLM OpenAI-compatible base URL, without `/v1` |
-| `COMFYUI_LLM_MODEL` | `llm-qwen38-w4a16` | served model name |
+| `COMFYUI_LLM_URL` | `http://llm-qwen38-27b.ialab.svc.cluster.local` | vLLM OpenAI-compatible base URL, without `/v1` |
+| `COMFYUI_LLM_MODEL` | `llm-qwen38-27b` | served model name |
 | `COMFYUI_LLM_MAX_IMAGES` | `40` | must match the server's image limit |
 
-## GPU handoff
+## Resident-model execution
 
-```text
-ComfyUI unloads managed models and clears its allocator cache
-→ POST /acquire on gpu_control: waits for free VRAM, wakes vLLM (restore + unlock + /wake_up, ~3 s)
-→ streamed generation with thinking (thinking_token_budget)
-→ POST /release with sleep=true: waits for other clients' leases, then /sleep?level=1 + cuda-checkpoint (~3 s)
-→ returns the final prompt to downstream nodes
-```
+The node sends requests directly to vLLM and returns the streamed answer. It does not unload ComfyUI models, acquire GPU leases, or call sleep/wake endpoints. Cancellation closes the stream without changing model residency. The `controller_url` widget is retained only for compatibility with saved workflows; its value is ignored.
 
-vLLM's sleep level 1 moves weights to RAM and drops the KV cache but leaves about 1.8 GiB (CUDA context, workspaces, CUDA graph pools); `cuda-checkpoint` then moves the engine's remaining CUDA state to host memory, so the vLLM process holds no VRAM. If the prompt cannot be confirmed released, the node withholds it and raises an error.
+The earlier GPU handoff controller in `server/gpu_control.py` and its tests are retained as legacy utilities. They are not used or required by the current node. Deployments that depend on automatic GPU handoff should retain the earlier implementation rather than expect that behavior from this version.
 
-## gpu_control
+## Related nodes and source
 
-`server/gpu_control.py` (Python standard library only) listens on port 8001 and hands out usage leases:
+This repository is the canonical source. The duplicate `ialab/comfyui-qwen-composer` folder in the XavierLAB GitOps repository was retired after its resident-model implementation was synchronized here.
 
-- `POST /acquire {owner, ttl?, free_comfyui?}` wakes the model if needed and returns a lease. Waking requires `WAKE_FREE_MIB` (24,500) free; when short and `free_comfyui` is true, an idle ComfyUI (`COMFYUI_URL`) is asked to `/free` first.
-- `POST /release {lease, sleep?}` returns the lease; `sleep: true` waits up to 15 minutes for other leases, then suspends.
-- `POST /suspend` (refused while leases are held), `POST /resume`, `GET /state`.
-
-It has no authentication: restrict it to trusted clients (for example with a Kubernetes NetworkPolicy). Clients that call vLLM without a lease hang while it sleeps.
+The separate `ComfyUI-Qwen-Prompt-Composer-H3` and `ComfyUI-Qwen-Prompt-Composer-Generic` packages call the Prompt Enhancer API and maintain their own repositories. The laboratory's former `prompt_creator_qwen` workflow was archived on 2026-09-22 as `workflow-archive/prompt_creator_qwen-20260922.json`; the H3 workflow uses its dedicated node, and other prompt apps use Generic.
 
 ## Inputs
 
@@ -85,4 +73,6 @@ python -m pytest --confcutdir=tests tests
 node --test tests/dynamic_inputs.test.mjs
 ```
 
-Live validation on 2026-09-22: a text-only workflow completed in 20 s and a three-image workflow in 40 s, both starting from a suspended model, and GPU usage returned to the pre-run level (the vLLM process at 0). Decode speed after a suspend/restore cycle matched the speed before it. Heavy downstream image/video rendering and broad hardware/runtime compatibility remain to be evaluated.
+Historical validation of the former GPU handoff implementation on 2026-09-22: a text-only workflow completed in 20 s and a three-image workflow in 40 s, both starting from a suspended model, and GPU usage returned to the pre-run level (the vLLM process at 0). Decode speed after a suspend/restore cycle matched the speed before it. Heavy downstream image/video rendering and broad hardware/runtime compatibility remain to be evaluated.
+
+Source consolidation on 2026-10-19: the runtime `custom_node/nodes.py` matches the installed resident-model implementation byte for byte. Tests cover direct streamed completion, ignored legacy controller URLs, cancellation and failures without unloading models, payload construction and dynamic input compatibility. No service restart is required to consolidate these source repositories.

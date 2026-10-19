@@ -1,8 +1,6 @@
-"""Automatic thinking prompt composition on vLLM with a confirmed VRAM release barrier.
+"""Automatic thinking prompt composition on the vLLM Qwen3.8 resident on its dedicated GPU.
 
-Flow: ComfyUI unloads its models -> lease on the vLLM pod's gpu_control wakes the model ->
-streamed generation with thinking -> release with sleep=true suspends vLLM (sleep level 1 +
-cuda-checkpoint) -> only then is the prompt returned, so the next nodes get the GPU.
+Flow: streamed generation with thinking straight from /v1/chat/completions; ComfyUI keeps its models loaded.
 SGLangPromptComposer stays registered as a hidden alias so older workflows still load.
 """
 import json
@@ -16,36 +14,10 @@ from comfy.utils import ProgressBar
 from .core import build_messages, selected_slot
 
 LOG = logging.getLogger(__name__)
-DEFAULT_URL = os.getenv('COMFYUI_LLM_CONTROL_URL', 'http://llm-qwen38-w4a16-control.ialab.svc.cluster.local:8001')
-API_URL = os.getenv('COMFYUI_LLM_URL', 'http://llm-qwen38-w4a16.ialab.svc.cluster.local').rstrip('/')
-MODEL = os.getenv('COMFYUI_LLM_MODEL', 'llm-qwen38-w4a16')
-# vLLM --limit-mm-per-prompt (MM_IMAGES in llm-qwen38-w4a16/kubernetes/statefulset.yml).
+API_URL = os.getenv('COMFYUI_LLM_URL', 'http://llm-qwen38-27b.ialab.svc.cluster.local').rstrip('/')
+MODEL = os.getenv('COMFYUI_LLM_MODEL', 'llm-qwen38-27b')
+# vLLM --limit-mm-per-prompt (MM_IMAGES in llm-qwen38-27b/kubernetes/statefulset.yml).
 MAX_IMAGES = int(os.getenv('COMFYUI_LLM_MAX_IMAGES', '40'))
-LEGACY_URLS = ('http://sglang-qwen38.ialab.svc.cluster.local', 'http://10.150.14.59')
-
-
-def control_url(value):
-    value = (value or '').strip().rstrip('/')
-    if not value or value in LEGACY_URLS:
-        # Saved workflows still carry the retired SGLang controller.
-        return DEFAULT_URL.rstrip('/')
-    return value
-
-
-def request(base, path, body=None, timeout=15):
-    raw = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(base + path, data=raw, method='GET' if body is None else 'POST',
-                                 headers={'Content-Type': 'application/json'})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors='replace')[:600]
-        try:
-            detail = json.loads(detail).get('error') or detail
-        except (ValueError, AttributeError):
-            pass
-        raise RuntimeError(f'vLLM gpu_control HTTP {exc.code}: {detail}') from exc
 
 
 def stream_completion(payload):
@@ -88,7 +60,8 @@ class QwenPromptComposer:
         return {'required': {
             'prompt': ('STRING', {'multiline': True, 'default': ''}),
             'active_prompt': ('STRING', {'default': 'system_prompt_1'}),
-            'controller_url': ('STRING', {'default': DEFAULT_URL}),
+            # Unused; kept in place so saved workflows keep their widget order.
+            'controller_url': ('STRING', {'default': '', 'tooltip': 'Obsolete, ignored.'}),
             'max_tokens': ('INT', {'default': 24576, 'min': 1024, 'max': 32768}),
             'thinking_budget': ('INT', {'default': 16384, 'min': 256, 'max': 16384}),
             'temperature': ('FLOAT', {'default': 1.0, 'min': 0.0, 'max': 2.0, 'step': 0.01}),
@@ -109,12 +82,12 @@ class QwenPromptComposer:
     RETURN_NAMES = ('generated_text',)
     FUNCTION = 'compose'
     CATEGORY = 'text/LLM'
-    DESCRIPTION = ('Always thinking. Wakes the vLLM Qwen3.8, uses the selected external system prompt '
-                   'and puts the model back to sleep (no VRAM) before returning.')
+    DESCRIPTION = ('Always thinking. Uses the vLLM Qwen3.8 with the selected external system prompt '
+                   'on a dedicated GPU without unloading ComfyUI models.')
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        # A cached node must never bypass the memory handoff side effect.
+        # Always execute when explicitly queued, preserving the node's existing cache policy.
         return float('nan')
 
     def compose(self, prompt, active_prompt, controller_url, max_tokens, thinking_budget,
@@ -134,35 +107,12 @@ class QwenPromptComposer:
                    'temperature': temperature, 'top_p': top_p, 'top_k': top_k, 'seed': seed}
         if len(json.dumps(payload).encode()) > 48 * 1024 * 1024:
             raise ValueError('References exceed 48 MiB. Reduce their resolution or frame count.')
-        control = control_url(controller_url)
+        # The LLM runs on a dedicated GPU, so neither ComfyUI nor vLLM needs unloading.
         mm.throw_exception_if_processing_interrupted()
-        progress = ProgressBar(4)
-        mm.unload_all_models()
-        mm.soft_empty_cache()
+        progress = ProgressBar(1)
+        answer, usage = stream_completion(payload)
         progress.update_absolute(1)
-        mm.throw_exception_if_processing_interrupted()
-        # ComfyUI already freed its own models above; gpu_control only waits for the VRAM.
-        lease = request(control, '/acquire', {'owner': 'comfyui-composer', 'ttl': 2400, 'free_comfyui': False},
-                        timeout=960)['lease']
-        answer, released = None, False
-        try:
-            progress.update_absolute(2)
-            answer, usage = stream_completion(payload)
-            progress.update_absolute(3)
-        finally:
-            # Always put the model back to sleep, even on failure or cancel; waits for other leases.
-            try:
-                state = request(control, '/release', {'lease': lease, 'sleep': True}, timeout=1200)
-                released = state.get('state') == 'suspended'
-                if not released:
-                    LOG.error('vLLM did not confirm suspension: %s', state)
-            except Exception:
-                LOG.exception('Could not put vLLM back to sleep; do not run GPU workflows until it is suspended.')
-        if not released:
-            raise RuntimeError('vLLM did not confirm it released the GPU. The prompt was withheld; '
-                               'check gpu_control before running GPU workflows.')
-        progress.update_absolute(4)
-        LOG.info('vLLM prompt ready after VRAM release: %s; %s', reference_info, usage)
+        LOG.info('vLLM prompt ready (dedicated GPU): %s; %s', reference_info, usage)
         return {'ui': {'text': [answer]}, 'result': (answer,)}
 
 
